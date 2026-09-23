@@ -264,6 +264,7 @@ export default function Home() {
 	const [qrRelayActive, setQrRelayActive] = useState(false);
 	const [qrSource, setQrSource] = useState<QrSource | null>(null);
 	const qrSectionRef = useRef<HTMLDivElement | null>(null);
+	const hasLoggedAutomaticRefreshRef = useRef(false);
 
 	const updateStatus = (kind: StatusKind, message: string) => {
 		setStatusKind(kind);
@@ -350,6 +351,7 @@ export default function Home() {
 		setExpireCountdown(0);
 		setQrRelayActive(false);
 		setQrSource(null);
+		hasLoggedAutomaticRefreshRef.current = false;
 		setActionStatusKind("idle");
 		setActionStatusText(ACTION_STATUS_DEFAULT_TEXT);
 	};
@@ -373,6 +375,7 @@ export default function Home() {
 	const regenerateAutoQr = async (
 		source: QrSource,
 		action: AuditAction = source.mode === "manual" ? "manual_qr_generate" : "qr_generate",
+		shouldRecordAudit = true,
 	): Promise<boolean> => {
 		const offset = await getServerTimeOffset();
 		const currentTimestamp = Date.now() + offset;
@@ -384,7 +387,9 @@ export default function Home() {
 			setSignUrl("");
 			setExpireAt(0);
 			setExpireCountdown(0);
-			trackAuditEvent({ action, outcome: "failure", course: getCourseForSource(source), errorCode: "INVALID_QR_SOURCE" });
+			if (shouldRecordAudit) {
+				trackAuditEvent({ action, outcome: "failure", course: getCourseForSource(source), errorCode: "INVALID_QR_SOURCE" });
+			}
 			return false;
 		}
 
@@ -393,14 +398,18 @@ export default function Home() {
 			setSignUrl(payload);
 			setExpireAt(currentTimestamp + AUTO_QR_TTL_MS);
 			setQrDataUrl(imageUrl);
-			trackAuditEvent({ action, outcome: "success", course: getCourseForSource(source) });
+			if (shouldRecordAudit) {
+				trackAuditEvent({ action, outcome: "success", course: getCourseForSource(source) });
+			}
 			return true;
 		} catch {
 			setQrDataUrl("");
 			setSignUrl("");
 			setExpireAt(0);
 			setExpireCountdown(0);
-			trackAuditEvent({ action, outcome: "failure", course: getCourseForSource(source), errorCode: "QR_GENERATION_FAILED" });
+			if (shouldRecordAudit) {
+				trackAuditEvent({ action, outcome: "failure", course: getCourseForSource(source), errorCode: "QR_GENERATION_FAILED" });
+			}
 			return false;
 		}
 	};
@@ -514,7 +523,11 @@ export default function Home() {
 
 		const delay = Math.max(0, expireAt - (Date.now() + (timeOffsetRef.current?.offset ?? 0)));
 		const timer = window.setTimeout(async () => {
-			const ok = await regenerateAutoQr(qrSource, "qr_refresh");
+			const shouldRecordRefresh = !hasLoggedAutomaticRefreshRef.current;
+			if (shouldRecordRefresh) {
+				hasLoggedAutomaticRefreshRef.current = true;
+			}
+			const ok = await regenerateAutoQr(qrSource, "qr_refresh", shouldRecordRefresh);
 			if (!ok) {
 				if (qrSource.mode === "query") {
 					updateActionStatus("error", "签到码自动刷新失败，请重新选择课程");
@@ -565,6 +578,7 @@ export default function Home() {
 		setExpireAt(0);
 		setExpireCountdown(0);
 		setQrSource(null);
+		hasLoggedAutomaticRefreshRef.current = false;
 		updateStatus("loading", "正在查询课程…");
 
 		try {
@@ -601,6 +615,7 @@ export default function Home() {
 	const onPick = async (uuid: string, courseId: string) => {
 		setSelectedUuid(uuid);
 		const source: QrSource = { mode: "query", uuid, courseId };
+		hasLoggedAutomaticRefreshRef.current = false;
 		setQrSource(source);
 		trackAuditEvent({ action: "course_select", outcome: "success", course: getCourseForSource(source) });
 
@@ -635,6 +650,7 @@ export default function Home() {
 
 		setManualLoading(true);
 		setSelectedUuid("");
+		hasLoggedAutomaticRefreshRef.current = false;
 		setQrSource(source);
 
 		let ok = false;
