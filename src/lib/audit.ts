@@ -5,7 +5,6 @@ export const AUDIT_ACTIONS = [
 	"course_filter",
 	"course_select",
 	"qr_generate",
-	"qr_refresh",
 	"manual_qr_generate",
 	"qr_download",
 	"sign_url_copy",

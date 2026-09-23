@@ -16,6 +16,7 @@ describe("audit event normalization", () => {
 
 	it("rejects unsupported actions, invalid dates, and out-of-range counts", () => {
 		expect(normalizeAuditEvent({ action: "password_export", outcome: "success" })).toBeNull();
+		expect(normalizeAuditEvent({ action: "qr_refresh", outcome: "success" })).toBeNull();
 		expect(normalizeAuditEvent({ action: "course_filter", outcome: "success", courseDate: "2026-09-23" })).toBeNull();
 		expect(normalizeAuditEvent({ action: "course_filter", outcome: "success", resultCount: -1 })).toBeNull();
 	});
