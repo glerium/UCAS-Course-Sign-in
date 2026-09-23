@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { writeAuditEvent } from "@/lib/audit";
 
 const LOGIN_URL = "https://iclass.ucas.edu.cn:8181/app/user/login.action";
 const SIGN_URL = "https://iclass.ucas.edu.cn:8181/app/course/stu_scan_sign.action";
@@ -212,20 +213,28 @@ export async function POST(req: NextRequest) {
 	const startedAt = Date.now();
 	const requestId = crypto.randomUUID();
 	let stage: "login" | "sign" | "request" = "request";
+	let auditUsername: string | undefined;
+	let auditCourseId: string | undefined;
+	let auditOutcome: "success" | "failure" = "failure";
+	let auditCode = "REQUEST_REJECTED";
+	let auditUpstreamStatus: string | undefined;
 
 	try {
 		if (!isSameOriginRequest(req)) {
+			auditCode = "INVALID_ORIGIN";
 			return jsonWithHeaders({ message: "非法来源请求" }, { status: 403 });
 		}
 
 		const contentType = req.headers.get("content-type") ?? "";
 		if (!contentType.includes("application/json")) {
+			auditCode = "INVALID_CONTENT_TYPE";
 			return jsonWithHeaders({ message: "请求格式错误，请使用 application/json" }, { status: 415 });
 		}
 
 		const ip = getClientIp(req);
 		const rateLimitResult = consumeRateLimit(ip, Date.now());
 		if (!rateLimitResult.ok) {
+			auditCode = "RATE_LIMITED";
 			return jsonWithHeaders(
 				{ message: "请求过于频繁，请稍后再试", code: "RATE_LIMITED" },
 				{
@@ -241,6 +250,7 @@ export async function POST(req: NextRequest) {
 		try {
 			body = await req.json();
 		} catch {
+			auditCode = "INVALID_JSON";
 			return jsonWithHeaders({ message: "请求体 JSON 格式错误" }, { status: 400 });
 		}
 
@@ -249,16 +259,20 @@ export async function POST(req: NextRequest) {
 		const password = String(bodyObject.password ?? "");
 		const courseSchedIdRaw = String(bodyObject.courseSchedId ?? bodyObject.timeTableId ?? "");
 		const courseSchedId = normalizeCourseSchedId(courseSchedIdRaw);
+		auditUsername = username || undefined;
+		auditCourseId = courseSchedId ?? undefined;
 		const clientTimestamp =
 			typeof bodyObject.timestamp === "number" && Number.isFinite(bodyObject.timestamp)
 				? bodyObject.timestamp
 				: Date.now();
 
 		if (isCredentialInputInvalid(username, password)) {
+			auditCode = "INVALID_CREDENTIAL_INPUT";
 			return jsonWithHeaders({ message: "学号或密码格式错误" }, { status: 400 });
 		}
 
 		if (!courseSchedId) {
+			auditCode = "INVALID_COURSE_ID";
 			return jsonWithHeaders({ message: "课程 ID 格式错误" }, { status: 400 });
 		}
 
@@ -304,6 +318,7 @@ export async function POST(req: NextRequest) {
 		const userId = loginData?.result?.id;
 
 		if (loginData?.STATUS !== "0" || !sessionId || !userId) {
+			auditCode = "UPSTREAM_LOGIN_REJECTED";
 			return jsonWithHeaders({ message: "登录失败，请检查学号密码是否正确" }, { status: 401 });
 		}
 
@@ -347,11 +362,14 @@ export async function POST(req: NextRequest) {
 		}
 
 		const upstreamStatus = signData?.STATUS ?? "";
+		auditUpstreamStatus = upstreamStatus || undefined;
 		const stuSignId = signData?.result?.stuSignId ?? "";
 		const stuSignStatus = signData?.result?.stuSignStatus ?? "";
 		const upstreamMessage = signData?.result?.msg ?? signData?.ERRMSG ?? signData?.msg ?? signData?.message ?? "";
 
 		if (upstreamStatus === "0" && stuSignStatus === "1") {
+			auditOutcome = "success";
+			auditCode = "";
 			return jsonWithHeaders(
 				{
 					success: true,
@@ -367,6 +385,7 @@ export async function POST(req: NextRequest) {
 		}
 
 		if (upstreamStatus === "0" && stuSignStatus && stuSignStatus !== "1") {
+			auditCode = "SIGN_STATUS_INCOMPLETE";
 			return jsonWithHeaders(
 				{
 					success: false,
@@ -381,6 +400,7 @@ export async function POST(req: NextRequest) {
 			);
 		}
 
+		auditCode = "UPSTREAM_SIGN_REJECTED";
 		return jsonWithHeaders(
 			{
 				success: false,
@@ -404,6 +424,7 @@ export async function POST(req: NextRequest) {
 			errorMessage: error instanceof Error ? error.message : "Unknown error",
 			code: isApiError ? error.code : "UNEXPECTED_ERROR",
 		};
+		auditCode = isApiError ? error.code : "UNEXPECTED_ERROR";
 
 		console.error("[course-uuid/sign]", JSON.stringify(logPayload));
 
@@ -412,5 +433,14 @@ export async function POST(req: NextRequest) {
 		}
 
 		return jsonWithHeaders({ message: "服务暂时不可用，请稍后重试", code: "UNEXPECTED_ERROR" }, { status: 500 });
+	} finally {
+		await writeAuditEvent({
+			action: "direct_sign_result",
+			outcome: auditOutcome,
+			username: auditUsername,
+			courseId: auditCourseId,
+			errorCode: auditCode || undefined,
+			upstreamStatus: auditUpstreamStatus,
+		});
 	}
 }

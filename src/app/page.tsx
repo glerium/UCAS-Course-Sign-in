@@ -33,6 +33,26 @@ type DirectSignResponse = {
 type ThemeMode = "system" | "light" | "dark";
 type StatusKind = "idle" | "loading" | "success" | "error" | "info";
 type FeatureMode = "query" | "manual";
+type AuditAction =
+	| "course_filter"
+	| "course_select"
+	| "qr_generate"
+	| "qr_refresh"
+	| "manual_qr_generate"
+	| "qr_download"
+	| "sign_url_copy"
+	| "direct_sign_attempt"
+	| "direct_sign_result";
+
+type ClientAuditEvent = {
+	action: AuditAction;
+	outcome: "success" | "failure";
+	course?: CourseItem;
+	keyword?: string;
+	resultCount?: number;
+	errorCode?: string;
+	upstreamStatus?: string;
+};
 
 type RepoStarsCache = {
 	stars: number;
@@ -255,6 +275,36 @@ export default function Home() {
 		setActionStatusText(message);
 	};
 
+	const trackAuditEvent = (event: ClientAuditEvent) => {
+		const safeUsername = username.trim();
+		if (!safeUsername) {
+			return;
+		}
+		void fetch("/api/audit-events", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			keepalive: true,
+			body: JSON.stringify({
+				action: event.action,
+				outcome: event.outcome,
+				username: safeUsername,
+				courseDate: toYyyyMMdd(date),
+				courseId: event.course?.id,
+				courseUuid: event.course?.uuid,
+				courseName: event.course?.courseName,
+				teacherName: event.course?.teacherName,
+				keyword: event.keyword,
+				resultCount: event.resultCount,
+				errorCode: event.errorCode,
+				upstreamStatus: event.upstreamStatus,
+			}),
+		}).catch(() => undefined);
+	};
+
+	const getCourseForSource = (source: QrSource): CourseItem | undefined => {
+		return source.mode === "query" ? courses.find((course) => course.uuid === source.uuid) : undefined;
+	};
+
 	const timeOffsetRef = useRef<{ offset: number; fetchedAt: number } | null>(null);
 	const OFFSET_TTL_MS = 30 * 1000;
 
@@ -320,7 +370,10 @@ export default function Home() {
 		});
 	};
 
-	const regenerateAutoQr = async (source: QrSource): Promise<boolean> => {
+	const regenerateAutoQr = async (
+		source: QrSource,
+		action: AuditAction = source.mode === "manual" ? "manual_qr_generate" : "qr_generate",
+	): Promise<boolean> => {
 		const offset = await getServerTimeOffset();
 		const currentTimestamp = Date.now() + offset;
 		// 签到时间戳减去缓冲，弥补 UCAS 两台服务器间的时钟偏差
@@ -331,6 +384,7 @@ export default function Home() {
 			setSignUrl("");
 			setExpireAt(0);
 			setExpireCountdown(0);
+			trackAuditEvent({ action, outcome: "failure", course: getCourseForSource(source), errorCode: "INVALID_QR_SOURCE" });
 			return false;
 		}
 
@@ -339,12 +393,14 @@ export default function Home() {
 			setSignUrl(payload);
 			setExpireAt(currentTimestamp + AUTO_QR_TTL_MS);
 			setQrDataUrl(imageUrl);
+			trackAuditEvent({ action, outcome: "success", course: getCourseForSource(source) });
 			return true;
 		} catch {
 			setQrDataUrl("");
 			setSignUrl("");
 			setExpireAt(0);
 			setExpireCountdown(0);
+			trackAuditEvent({ action, outcome: "failure", course: getCourseForSource(source), errorCode: "QR_GENERATION_FAILED" });
 			return false;
 		}
 	};
@@ -458,7 +514,7 @@ export default function Home() {
 
 		const delay = Math.max(0, expireAt - (Date.now() + (timeOffsetRef.current?.offset ?? 0)));
 		const timer = window.setTimeout(async () => {
-			const ok = await regenerateAutoQr(qrSource);
+			const ok = await regenerateAutoQr(qrSource, "qr_refresh");
 			if (!ok) {
 				if (qrSource.mode === "query") {
 					updateActionStatus("error", "签到码自动刷新失败，请重新选择课程");
@@ -491,6 +547,14 @@ export default function Home() {
 	const hasKeyword = keyword.trim().length > 0;
 	const emptyHelpText = hasKeyword ? "可先清空筛选词，再查看全部课程" : "检查日期是否为上课日，并确认学号与密码正确";
 	const isCourseSelected = (uuid: string): boolean => selectedUuid === uuid;
+	const onKeywordChange = (nextKeyword: string) => {
+		setKeyword(nextKeyword);
+		const word = nextKeyword.trim().toLowerCase();
+		const resultCount = word
+			? courses.filter((course) => course.courseName.toLowerCase().includes(word) || course.teacherName.toLowerCase().includes(word)).length
+			: courses.length;
+		trackAuditEvent({ action: "course_filter", outcome: "success", keyword: nextKeyword, resultCount });
+	};
 
 	const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
 		event.preventDefault();
@@ -538,6 +602,7 @@ export default function Home() {
 		setSelectedUuid(uuid);
 		const source: QrSource = { mode: "query", uuid, courseId };
 		setQrSource(source);
+		trackAuditEvent({ action: "course_select", outcome: "success", course: getCourseForSource(source) });
 
 		const ok = await regenerateAutoQr(source);
 		if (!ok) {
@@ -563,6 +628,7 @@ export default function Home() {
 		const payload = getPayloadFromSource(source, Date.now() + (timeOffsetRef.current?.offset ?? 0));
 
 		if (!payload) {
+			trackAuditEvent({ action: "manual_qr_generate", outcome: "failure", errorCode: "INVALID_MANUAL_IDENTIFIER" });
 			updateStatus("error", "请输入纯数字课程ID或32位UUID");
 			return;
 		}
@@ -603,6 +669,7 @@ export default function Home() {
 		const deadline = Date.now() + offset + DOWNLOAD_QR_TTL_MS;
 		const payload = getPayloadFromSource(qrSource, deadline);
 		if (!payload) {
+			trackAuditEvent({ action: "qr_download", outcome: "failure", course: getCourseForSource(qrSource), errorCode: "INVALID_QR_SOURCE" });
 			if (featureMode === "query") {
 				updateActionStatus("error", "下载二维码失败，请重新生成签到码");
 				return;
@@ -618,12 +685,14 @@ export default function Home() {
 			const safeIdentifier = getSignIdentifierForFilename(payload, selectedUuid);
 			link.download = `ucas-signin-${safeIdentifier}-${deadline}.png`;
 			link.click();
+			trackAuditEvent({ action: "qr_download", outcome: "success", course: getCourseForSource(qrSource) });
 			if (featureMode === "query") {
 				updateActionStatus("success", "二维码已开始下载（10秒有效）");
 				return;
 			}
 			updateStatus("success", "二维码已开始下载（10秒有效）");
 		} catch {
+			trackAuditEvent({ action: "qr_download", outcome: "failure", course: getCourseForSource(qrSource), errorCode: "QR_DOWNLOAD_FAILED" });
 			if (featureMode === "query") {
 				updateActionStatus("error", "下载二维码失败，请稍后重试");
 				return;
@@ -639,12 +708,14 @@ export default function Home() {
 
 		try {
 			await navigator.clipboard.writeText(signUrl);
+			trackAuditEvent({ action: "sign_url_copy", outcome: "success", course: qrSource ? getCourseForSource(qrSource) : undefined });
 			if (featureMode === "query") {
 				updateActionStatus("info", "已复制签到链接");
 				return;
 			}
 			updateStatus("info", "已复制签到链接");
 		} catch {
+			trackAuditEvent({ action: "sign_url_copy", outcome: "failure", course: qrSource ? getCourseForSource(qrSource) : undefined, errorCode: "CLIPBOARD_WRITE_FAILED" });
 			if (featureMode === "query") {
 				updateActionStatus("error", "复制签到链接失败，请手动复制");
 				return;
@@ -709,6 +780,7 @@ export default function Home() {
 
 		setDirectSignLoading(true);
 		updateActionStatus("loading", "正在发起签到…");
+		trackAuditEvent({ action: "direct_sign_attempt", outcome: "success", course: selectedCourse ?? undefined });
 
 		try {
 			// 优先从当前二维码URL中提取时间戳，与扫码行为完全一致
@@ -740,9 +812,22 @@ export default function Home() {
 			const data = (await res.json()) as DirectSignResponse;
 
 			if (!res.ok || !data.success) {
+				trackAuditEvent({
+					action: "direct_sign_result",
+					outcome: "failure",
+					course: selectedCourse ?? undefined,
+					errorCode: data.upstreamStatus ? "UPSTREAM_SIGN_REJECTED" : "SIGN_REQUEST_FAILED",
+					upstreamStatus: data.upstreamStatus,
+				});
 				updateActionStatus("error", data.message ?? "签到失败，请稍后重试");
 				return;
 			}
+			trackAuditEvent({
+				action: "direct_sign_result",
+				outcome: "success",
+				course: selectedCourse ?? undefined,
+				upstreamStatus: data.upstreamStatus,
+			});
 
 			const signIdText = data.result?.stuSignId ? `（签到记录 ${data.result.stuSignId}）` : "";
 			const refreshed = await refreshCoursesAfterSign();
@@ -755,6 +840,7 @@ export default function Home() {
 				);
 			}
 		} catch {
+			trackAuditEvent({ action: "direct_sign_result", outcome: "failure", course: selectedCourse ?? undefined, errorCode: "NETWORK_ERROR" });
 			updateActionStatus("error", "网络异常，签到请求未完成");
 		} finally {
 			setDirectSignLoading(false);
@@ -978,7 +1064,7 @@ export default function Home() {
 											name="courseFilter"
 											aria-label="筛选课程"
 											value={keyword}
-											onChange={(e) => setKeyword(e.target.value)}
+											onChange={(e) => onKeywordChange(e.target.value)}
 											placeholder="输入课程名或教师姓名进行筛选"
 										/>
 									) : null}

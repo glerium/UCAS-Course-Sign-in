@@ -59,6 +59,12 @@ npm run start
 npm run lint
 ```
 
+5. 审计日志测试
+
+```bash
+npm test
+```
+
 ### 部署上线（可选）
 
 推荐使用 Vercel 进行部署，步骤如下：
@@ -68,6 +74,34 @@ npm run lint
 3. Framework 自动识别为 Next.js
 4. Build Command 使用默认的 `npm run build`
 5. 部署完成后访问生成的域名
+
+### 审计日志数据库（Neon）
+
+审计日志将永久记录完整学号、课程信息、操作结果和安全错误码；不会记录密码、`sessionId`、签到链接或二维码内容。日志仅供管理员直接查询数据库。
+
+1. 在 Vercel 项目的 **Storage** 页面通过 Marketplace 连接 **Neon** PostgreSQL。连接完成后，Vercel 会为项目注入 `DATABASE_URL`。
+2. 本地开发时，使用 Vercel CLI 拉取环境变量，或自行在终端设置 `DATABASE_URL`：
+
+```bash
+vercel env pull .env.local
+```
+
+3. 使用该环境变量初始化可重复执行的表和索引：
+
+```bash
+node --env-file=.env.local scripts/init-audit-db.mjs
+```
+
+线上部署会从 `DATABASE_URL` 自动写入 `audit_events`；未配置数据库时，查询和签到功能不会中断，但不会持久保存审计记录。
+
+管理员可在 Neon SQL Editor 中使用只读查询，例如：
+
+```sql
+SELECT created_at, username, action, outcome, course_name, error_code
+FROM audit_events
+ORDER BY created_at DESC
+LIMIT 100;
+```
 
 ## 工作流程
 
